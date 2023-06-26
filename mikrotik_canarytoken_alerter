@@ -1,0 +1,135 @@
+# Set notification type: DNS or HTTP
+:global notificationType "DNS";
+# Notify on events, can be 1 or more, comma separated of:
+# telnet, winbox, ssh, api, ftp, http, new_neighbour
+# Eg: "winbox, ssh, new_neighbour" or just "ssh"
+# telnet, winbox, ssh, api, ftp, http alert on authentication failure
+# new_neighbour alerts when new neighbour (/ip/neighbour) is discovered, eg, new LLDP or CDP neighbour.
+:global notifyOn "winbox,ssh,telnet,api,web";
+:global tokenDNSUrl ".canarytokens.com"
+# Below is notifications per run max
+:global rateLimit 2;
+
+# State variables
+:global lastNotification;
+:global lastNeighbours;
+
+:global currentBuf [ :toarray [ /log find buffer=canary message~"login failure"  ] ] ;
+:global currentLineCount [ :len $currentBuf ] ;
+:global currentLineTime;
+:global lastLineTime  [ :totime [/log get [ :pick $currentBuf ($currentLineCount -1) ] time   ] ];
+
+:global processed;
+:global toProcess;
+:local newProcessed;
+:local notifies 0
+
+
+# Try to encode to base32
+:global base32 do={
+:local RFC4648ALPHABET "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+:global PRINTABLE {" "=32 ; "!"=33 ; "\""=34 ; "#"=35 ; "$"=36 ; "%"=37 ; "&"=38 ; "'"=39 ; "("=40 ; ")"=41 ; "*"=42 ; "+"=43 ; ","=44 ; "-"=45 ; "."=46 ; "/"=47 ; "0"=48 ; "1"=49 ; "2"=50 ; "3"=51 ; "4"=52 ; "5"=53 ; "6"=54 ; "7"=55 ; "8"=56 ; "9"=57 ; ":"=58 ; ";"=59 ; "<"=60 ; "="=61 ; ">"=62 ; "?"=63 ; "@"=64 ; "A"=65 ; "B"=66 ; "C"=67 ; "D"=68 ; "E"=69 ; "F"=70 ; "G"=71 ; "H"=72 ; "I"=73 ; "J"=74 ; "K"=75 ; "L"=76 ; "M"=77 ; "N"=78 ; "O"=79 ; "P"=80 ; "Q"=81 ; "R"=82 ; "S"=83 ; "T"=84 ; "U"=85 ; "V"=86 ; "W"=87 ; "X"=88 ; "Y"=89 ; "Z"=90 ; "["=91 ; "\\"=92 ; "]"=93 ; "^"=94 ; "_"=95 ; "`"=96 ; "a"=97 ; "b"=98 ; "c"=99 ; "d"=100 ; "e"=101 ; "f"=102 ; "g"=103 ; "h"=104 ; "i"=105 ; "j"=106 ; "k"=107 ; "l"=108 ; "m"=109 ; "n"=110 ; "o"=111 ; "p"=112 ; "q"=113 ; "r"=114 ; "s"=115 ; "t"=116 ; "u"=117 ; "v"=118 ; "w"=119 ; "x"=120 ; "y"=121 ; "z"=122 ; "{"=123 ; "|"=124 ; "}"=125 ; "~"=126; ""=0  }
+
+:local input $1
+
+:global ordWithDefault do={
+  :global PRINTABLE
+  if ([:typeof $1] = "nil") do={ :return 0 } else={ :return ($PRINTABLE->"$1")} 
+}
+
+:local i 0;
+:global output ""
+
+:while ( $i < [:len $input] ) do={
+  :local chunk [:pick $input $i ($i+5)]
+  :set $i ($i + 5);
+  :local l1 ([[$ordWithDefault [:pick $chunk 0 1]]  & 0xF8] >> 3);
+  :local l2 (((([$ordWithDefault [:pick $chunk 0 1]])  & 0x07) << 2 ) | ((([$ordWithDefault [:pick $chunk 1 2]])  & 0xC0) >> 6))
+  :local l3 ((([$ordWithDefault [:pick $chunk 1 2]])  & 0x3E) >> 1)
+  :local l4 (((([$ordWithDefault [:pick $chunk 1 2]])  & 0x01) << 4 ) | ((([$ordWithDefault [:pick $chunk 2 3]])  & 0xF0) >> 4) )
+  :local l5 (((([$ordWithDefault [:pick $chunk 2 3]])  & 0x0F) << 1 ) | ((([$ordWithDefault [:pick $chunk 3 4]])) >> 7) )
+  :local l6  ((([$ordWithDefault [:pick $chunk 3 4]])  & 0x7C) >> 2)
+  :local l7 (((([$ordWithDefault [:pick $chunk 3 4]])  & 0x03) << 3 ) | ((([$ordWithDefault [:pick $chunk 4 5]])  & 0xE0) >> 5) )
+  :local l8 ((([$ordWithDefault [:pick $chunk 4 5]])  & 0x1F))
+   
+  :set output ($output . "$[:pick $RFC4648ALPHABET $l1]" . "$[:pick $RFC4648ALPHABET $l2]" . "$[:pick $RFC4648ALPHABET $l3]" . "$[:pick $RFC4648ALPHABET $l4]" . "$[:pick $RFC4648ALPHABET $l5]" . "$[:pick $RFC4648ALPHABET $l6]" . "$[:pick $RFC4648ALPHABET $l7]" . "$[:pick $RFC4648ALPHABET $l8]")
+}
+
+if ([:len $input] % 5 != 0) do={
+  :local numExtra (8-([:len $input]%5*8+4)/5);
+  :set $output [:pick $output 0 ([:len $output] - $numExtra)]
+}
+# Split with . as per canarytokens.org docs
+:set i 63
+:local chunked ""
+:local chunk [:pick $output 0 63]
+:set chunked $chunk
+:while ( $i < [:len $output] ) do={
+  :local chunk [:pick $output $i ($i+63)]
+  :set chunked ($chunked . "." . $chunk)
+  :set i ($i+63)
+}
+:return $chunked
+}
+
+#:put "Old processed: $processed"
+
+# Right, try to remove anything that is not in the log buffer, but still in processed (don't need it)
+foreach p in $processed do={
+  if ([:find $currentBuf $p] >= 0) do={
+    #:put "processed item in buffer keep it"
+    :set $newProcessed ($newProcessed, $p)
+  } else={
+    :put "processed item not in log buffer, remove it from processed"
+  }
+}
+
+
+# Anything not in processed, but in the log buffer, must be processed (and added to processed)
+foreach r in $currentBuf do={
+  if ([:find $processed $r] >= 0) do={
+    #:put "processed item in buffer do nothing"
+  } else={
+    #:put "log buffer item not in processed, add and process"
+    :set $newProcessed ($newProcessed, $r)
+    :set $toProcess ($toProcess, $r)
+  }
+}
+:set $processed $newProcessed
+#:put "New Processed: $newProcessed"
+#:put "To Process: $toProcess"
+
+#just check if time > lastNotified time
+
+:global failmsg  "login failure for user "
+:global frommsg  " from "
+:global viamsg   " via "
+
+:foreach i in $toProcess do={
+ #:put "process $i"
+ :local rmess [/log get $i message]
+ #:set message [/log get [ :pick $currentBuf ($currentLineCount-1) ] message];
+ :if (($rmess~$failmsg) and ($rmess~$frommsg) and ($rmess~$viamsg)) do={
+   :local userinside [:pick $rmess ([:find $rmess $failmsg -1] + [:len $failmsg]) [:find $rmess $frommsg -1]]
+   :local ipinside [:pick $rmess ([:find $rmess $frommsg -1] + [:len $frommsg]) [:find $rmess $viamsg -1]]
+   :local intinside [:pick $rmess ([:find $rmess $viamsg -1] + [:len $viamsg]) [:len $rmess]]
+   #:put "token alert $userinside from $ipinside via $intinside"
+   :if ($notifyOn~"$intinside(,|\$)") do={
+     if ($notifies < $rateLimit) do={
+       :put "notify on set for $intinside"
+       :set $notifies ($notifies + 1) 
+       if ($notificationType = "DNS") do={
+        :put "Alert via $tokenDNSUrl"
+        :local prefix ([$base32 ("Chnl:$intinside Usr:$userinside IP:$ipinside")])
+        :put "Prefix: $prefix IP: $ipinside"
+        :resolve ($prefix . "." . "G" . [:rndnum 10 99] . "." . $tokenDNSUrl)
+       } else={
+       }
+     } else={
+       :put "too many notifies (> $rateLimit)"
+     }
+   }
+  }
+}
+
+:set $toProcess [ :toarray "" ];
