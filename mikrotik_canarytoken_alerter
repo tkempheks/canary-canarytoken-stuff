@@ -1,3 +1,7 @@
+# Built by https://twitter.com/denver_a #
+# The script requires a scheduler and logging configured # 
+# Add DNS Canarytoken to tokenDNSUrl #
+
 # Set notification type: DNS or HTTP
 :global notificationType "DNS";
 # Notify on events, can be 1 or more, comma separated of:
